@@ -17,7 +17,6 @@ int main(int argc, char *argv[]) {
 
     printf("Starting proxy on port %d...\n", port);
 
-    // TODO: Initialize socket, bind, listen, and accept connections
     start_tcp_proxy(port);
 
     return 0;
