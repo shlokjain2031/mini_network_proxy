@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #define MAX_CLIENTS  FD_SETSIZE
 #define BACKLOG      10
@@ -23,6 +24,25 @@ void set_nonblocking(const int fd) {
         perror("fcntl F_SETFL O_NONBLOCK");
         exit(1);
     }
+}
+
+void *client_handler(void *arg) {
+    const int client_fd = *(int *)arg;
+    free(arg);
+
+    // Get the thread ID
+    const pthread_t tid = pthread_self();
+
+    // Create a unique greeting message
+    char buffer[100];
+    snprintf(buffer, sizeof(buffer), "Hello from proxy server! (Thread ID: %lu)\n", (unsigned long)tid);
+
+    const ssize_t sent = send(client_fd, buffer, strlen(buffer), 0);
+    if (sent == -1) perror("send");
+    else printf("Sent greeting from thread %lu to client FD %d\n", (unsigned long)tid, client_fd);
+
+    close(client_fd);
+    return NULL;
 }
 
 void start_tcp_proxy(int port) {
@@ -65,71 +85,37 @@ void start_tcp_proxy(int port) {
 
     freeaddrinfo(res);
 
-    fd_set master_set, read_set;
-    FD_ZERO(&master_set);
-    FD_SET(listen_fd, &master_set); // master_set keeps track of all FDs we care about
-    int max_fd = listen_fd;
-
-    int client_fds[MAX_CLIENTS]; // keeps track of all currently connected client sockets
-    memset(client_fds, -1, sizeof(client_fds));
-
     while (1) {
-        read_set = master_set;  // select() modifies the set, so copy
+        struct sockaddr_storage client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        const int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
 
-        const int ready = select(max_fd + 1, &read_set, NULL, NULL, NULL);
-        if (ready < 0) {
-            if (errno == EINTR) continue;  // interrupted by signal
-            perror("select");
-            break;
-        }
-
-        // Check if new client is connecting
-        if (FD_ISSET(listen_fd, &read_set)) {
-            while (1) {
-                struct sockaddr_storage client_addr;
-                socklen_t client_len = sizeof(client_addr);
-                int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
-
-                if (client_fd == -1) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                    perror("accept");
-                    break;
-                }
-
-                printf("Accepted new client: FD %d\n", client_fd);
-                set_nonblocking(client_fd);
-
-                // track the new client
-                for (int i = 0; i < MAX_CLIENTS; i++) {
-                    if (client_fds[i] == -1) {
-                        client_fds[i] = client_fd;
-                        break;
-                    }
-                }
-
-                FD_SET(client_fd, &master_set);
-                if (client_fd > max_fd) max_fd = client_fd;
+        if (client_fd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(10000);  // Sleep 10ms to avoid busy loop
+                continue;
             }
+            perror("accept");
+            continue;
         }
 
-        // Check existing clients for readiness
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            int fd = client_fds[i];
-            if (fd == -1) continue;
+        printf("Accepted new client: FD %d\n", client_fd);
 
-            if (FD_ISSET(fd, &read_set)) {
-                // Instead of reading, we just send a greeting and close
-                ssize_t sent = send(fd, GREETING, strlen(GREETING), 0);
-                if (sent == -1) {
-                    perror("send");
-                } else {
-                    printf("Sent greeting to FD %d\n", fd);
-                }
-                close(fd);
-                FD_CLR(fd, &master_set);
-                client_fds[i] = -1;
-            }
+        int *pclient_fd = malloc(sizeof(int));
+        if (!pclient_fd) {
+            perror("malloc"); close(client_fd);
+            continue;
         }
+        *pclient_fd = client_fd;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, client_handler, pclient_fd) != 0) {
+            perror("pthread_create");
+            close(client_fd);
+            free(pclient_fd);
+            continue;
+        }
+        pthread_detach(tid);  // No need to join
     }
 
     close(listen_fd);
